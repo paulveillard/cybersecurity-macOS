@@ -1,0 +1,39 @@
+{
+  "name": "cybersecurity-macOS",
+  "version": "1.1.0",
+  "description": " This repo is a collection of awesome Mac applications and tools for developers and designers. ",
+  "homepage": "https://github.com/paulveillard/cybersecurity-macOS",
+  "main": "dist/cybersecurity-macOS.json",
+  "scripts": {
+    "start": "npm run create:html && npm run create:ast",
+    "create:html": "node build/create.mjs",
+    "create:ast": "node build/ast.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/paulveillard/cybersecurity-macOS"
+  },
+  "keywords": [
+    "cybersecurity",
+    "cybersecurity-macOS",
+    "mac",
+    "macosx",
+    "osx"
+  ],
+  "files": [
+    "dist/cybersecurity-macOS.json",
+    "dist/cybersecurity-macOS.zh.json"
+  ],
+  "author": "Paul Veillard <management@paulveillard.com>",
+  "license": "CC-BY-SA-4.0",
+  "bugs": {
+    "url": "https://github.com/paulveillard/cybersecurity-macOS"
+  },
+  "devDependencies": {
+    "fs-extra": "10.0.0",
+    "remark": "13.0.0",
+    "remark-gfm": "1.0.0",
+    "markdown-to-html-cli": "3.1.5",
+    "to-vfile": "7.0.0"
+  }
+}
