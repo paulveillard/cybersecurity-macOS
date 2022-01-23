@@ -1,0 +1,131 @@
+#!/usr/bin/env zsh
+# macos-scripts/pkg-expand
+
+# pkg-expand
+#  Expands a package serches for embeded packes and expands them
+#  Searches for Bill of Material (Bom) files and reads them  
+
+set -uo pipefail
+# -u prevent using undefined variables
+# -o pipefail force pipelines to fail on first non-zero status code
+
+IFS=$'\n\t'
+# Set Internal Field Separator to newlines and tabs
+# This makes bash consider newlines and tabs as separating words
+# See: http://redsymbol.net/articles/unofficial-bash-strict-mode/
+
+function usage {
+
+  echo -e "\\n Expands a package and any packages inside it"
+  echo "  ./pkg-expand {.pkg}"
+  
+  exit 0
+}
+
+
+function pkg_search {
+
+  while IFS=$'\n' read -r package; do 
+    packages+=("${package}"); 
+  done < <(find "${expand_dir}" -name "*.pkg" -type f)
+}
+
+
+function unpack {
+
+  local embedded_pkg_name
+  declare -i counter=0 
+
+  for package in "${packages[@]}"; do
+    embedded_pkg_name="$(basename "${package}" | awk -F '.pkg' '{print $1}')"
+    if [[ "${embedded_pkg_name}" == "${pkg_name}" ]]; then
+      embedded_pkg_name="${embedded_pkg_name}-${counter}"
+      counter=+1
+    fi
+    pkgutil --expand-full "${package}" "${expand_dir}/${embedded_pkg_name}"
+  done
+}
+
+
+function bom_search {
+  while IFS=$'\n' read -r bom; do 
+    boms+=("${bom}"); 
+  done < <(find "${expand_dir}" -name "Bom" -type f)
+}
+
+
+function bom_read {
+  local pkg_name
+
+  for bom in "${boms[@]}"; do
+    pkg_name=$(echo "${bom}" | awk -F '/' '{print $(NF-1)}' | tr -d '.pkg')
+    lsbom "${bom}" > "${expand_dir}/${pkg_name}-Bom"
+  done
+
+}
+
+
+function find_preinstall {
+  while IFS=$'\n' read -r preinstall; do 
+    preinstall_scripts+=("${preinstall}"); 
+  done < <(find "${expand_dir}" -name 'preinstall' -type f)
+}
+
+function check_preinstall {
+
+  for script in "${preinstall_scripts[@]}"; do
+    echo "Checking ${script}"
+    grep -ni "cp /tmp" "${script}"
+    grep -ni "chmod 777 /Applications" "${script}"
+    grep -ni "chown root:admin /Applications/" "${script}"
+  done
+}
+
+function find_postinstall {
+  while IFS=$'\n' read -r postinstall; do 
+    postinstall_scripts+=("${postinstall}"); 
+  done < <(find "${expand_dir}" -name 'postinstall' -type f)
+}
+
+function check_postinstall {
+
+  for script in "${postinstall_scripts[@]}"; do
+    echo "Checking ${script}"
+    grep -ni "cp /tmp" "${script}"
+    grep -ni "chmod 777 /Applications" "${script}"
+    grep -ni "chown root:admin /Applications/" "${script}"
+  done
+}
+
+
+function main {
+
+  declare -a packages
+  declare -a boms
+  declare -a preinstall_scripts
+  declare -a postinstall_scripts
+
+  arg=${1:-"usage"}
+
+  if [[ "${arg}" =~ ^(usage|help|-h|--help|🤷‍♂️|🤷‍♀️|"¯\_(ツ)_/¯")$ ]]; then
+    usage
+  fi
+
+  pkg_name=$(basename "${arg}" | awk -F '.pkg' '{print $1}')
+  readonly expand_dir="/tmp/${pkg_name}"
+  mkdir "${expand_dir}"
+  pkgutil --expand-full "${arg}" "${expand_dir}/${pkg_name}"
+  
+  pkg_search
+  unpack
+  bom_search
+  bom_read
+
+  find_preinstall
+  find_postinstall
+  check_preinstall
+  check_postinstall
+}
+
+main "$@"
+

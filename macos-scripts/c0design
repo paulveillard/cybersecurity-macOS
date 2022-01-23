@@ -1,0 +1,350 @@
+#!/usr/bin/env zsh
+# macos-scripts/c0design
+
+# c0design
+#   Wrapper for codesign, spctl, stapler & pkgutil
+#   Check code signature and notarisation of applications and packages
+#   See Howard Oakley's (@howardnoakley) work:
+#     https://eclecticlight.co/2019/05/31/can-you-tell-whether-code-has-been-notarized/
+#     https://eclecticlight.co/2020/10/30/code-signatures-2-how-to-check-them/
+
+set -uo pipefail
+# -o pipefail force pipelines to fail on first non-zero status code
+# -u prevent using undefined variables
+
+IFS=$'\n\t'
+# Set Internal Field Separator to newlines and tabs
+# This makes bash consider newlines and tabs as separating words
+# See: http://redsymbol.net/articles/unofficial-bash-strict-mode/
+
+### Define Colours ###
+tput sgr0; 
+# reset colors
+
+RESET=$(tput sgr0)
+readonly RESET
+RED=$(tput setaf 1)
+readonly RED
+YELLOW=$(tput setaf 3)
+readonly YELLOW
+GREEN=$(tput setaf 64)
+readonly GREEN
+### END Colours ###
+
+
+function usage {
+  echo 
+  echo "  Wrapper for codesign, spctl, stapler & pkgutil"
+  echo "  Usage: ./c0design {usage | list | verify \$path_to_verify | thirdparty}"
+  echo
+
+  echo "  list        List all non system applications (excludes Xcode & Safari)"
+  echo "  verify      Check code signing and notarisation of application or package at \$path_to_verify"
+  echo "              Equivalent of codesign --verify --deep --strict && spctl --assess --type exec"
+  echo "              Equivalent of pkgutil --check-signature && spctl --assess --type install" 
+  echo "  thirdparty  Check code signing and notarisation of all non system applications"
+  echo
+  
+  exit 0
+}
+
+
+### Utility Functions ###
+# ctrl_c
+
+function ctrl_c {
+  echo -e "\\n[❌] ${USER} has chosen to quit!"
+  exit 1
+}
+
+### END Utility Functions ###
+
+
+function get_applications {
+  # get_applications
+  #   Get list of all applications on system via system_profiler
+  #   Ignore system applications, Xcode and Safari
+  #   Produces array, $apps, of non system apps
+  
+  while IFS=$'\n' read -r app; do
+   
+    if [[ "${app}" =~ /System/ ]]; then
+      continue
+      # Skip everything in /System/Applications/ and /System/Library/
+      #   since they can't be third party apps
+    elif [[ "${app}" =~ Xcode.app ]]; then
+      continue
+      # Skip Xcode because it takes ages to run codesign on it
+    elif [[ "${app}" =~ Safari.app ]]; then
+      continue
+      # Skip Safari because it is a system application
+    fi
+    
+    apps+=("${app}");
+    # e.g. Adds "/Applications/1Password 7.app" to apps array
+
+  done < <(system_profiler SPApplicationsDataType \
+            | grep "Location: " \
+            | awk -F ': ' '{print $2}')
+}
+
+
+function verify_app_signature {
+  # verify_app_signature
+  #   Verify that app at $path_to_verify is correctly code signed
+  #   Save codesign output in $codesign_output for printing errors
+
+  declare -r path_to_verify=${1:?path_to_verify not passed to verify_app_signature}
+
+  if codesign_output="$(/usr/bin/codesign --verify --deep --strict "${path_to_verify}" 2>&1)"; then
+    # codesign sends all output to stderr, redirect it to std out
+    return 0
+  elif [[ "${codesign_output}" =~ No\ such\ file\ or\ directory ]]; then
+    echo "${path_to_verify}: No such file or directory"
+    exit 1
+  else
+    return 1
+  fi
+}
+
+
+function check_app_notarsied {
+  # check_app_notarsied
+  #   Check if app is allowed to be executed under current system policy
+  #   On systems with default settings this will check if app is notarised
+  #   If SecAssessment has been disabled spctl notarisation checks will fail
+  #   If system has SecAssessment disabled (e.g. spctl --master-disable has been executed)
+  #     you can execute codesign --test-requirement="=notarized" --verify to check notarisation
+
+  declare -r path_to_verify=${1:?path_to_verify not passed to check_app_notarsied}
+
+  if /usr/sbin/spctl --assess --type exec "${path_to_verify}" >/dev/null 2>&1; then
+    # Check if system policy allows execution of this code aka Notarised
+    return 0 
+  else
+    return 1
+  fi
+}
+
+
+function check_stapled_notarisation_ticket {
+  # check_stapled_notarisation_ticket
+  #   Check if the application or package at $path_to_verify has a locally stapled
+  #     notarisation ticket
+  #   Not having a locally stapled ticket is NOT a security issue, Apple can
+  #     hold the ticket on their servers with macOS reaching out to Apple to
+  #     validate the ticket.
+  #   See  Howard Oakley's (@howardnoakley) tweet:
+  #     https://twitter.com/howardnoakley/status/1369328846466650120
+
+  declare -r path_to_verify=${1:?path_to_verify not passed to check_stapled_notarisation_ticket}
+
+  if /usr/bin/stapler validate "${path_to_verify}" >/dev/null 2>&1; then
+    # Check if app has a notarisation ticket stapled to it
+    return 0
+  else
+    return 1
+  fi
+}
+
+
+function check_if_app_from_app_store {
+  # check_if_app_from_app_store
+  #   Checks if app is from Mac App Store
+  #     or from outside App Store based on intermediate certificate used
+  #     to sign the leaf certificate
+  #   Could also use 
+  #     mdls "${path_to_verify}" -name kMDItemAppStoreHasReceipt
+
+  declare -r path_to_verify=${1:?path_to_verify not passed to check_if_app_from_app_store}
+  codesign_output=$(/usr/bin/codesign --display --verbose=2 "${path_to_verify}" 2>&1)
+
+  if echo "${codesign_output}" | grep -q "Authority=Apple Mac OS Application Signing"; then
+    return 0
+  
+  elif echo "${codesign_output}" | grep -q "Authority=Developer ID Certification Authority"; then
+    return 1
+  fi
+}
+
+
+function verify_app {
+  # verify_app
+  #   Use the above helper functions to check application
+  #     1. Properly signed
+  #     2. Notarised
+  #     3. Locally stapled notarisation ticket
+  #     4. From Mac App Store or Developer ID App
+  #   echo to command line based on above criteria
+
+  declare -r path_to_verify=${1:?path_to_verify not passed to verify_app}
+  path_basename=$(/usr/bin/basename "${path_to_verify}")
+
+  if verify_app_signature "${path_to_verify}"; then
+    
+    if check_app_notarsied "${path_to_verify}"; then
+      
+      if check_stapled_notarisation_ticket "${path_to_verify}"; then
+        
+        if check_if_app_from_app_store "${path_to_verify}"; then
+          echo "${path_basename} ${GREEN}signed, properly verified & notarised${RESET} (stapled ticket) (App Store)"
+          # Wording from man page is "all codes verified properly as requested"
+        else
+          echo "${path_basename} ${GREEN}signed, properly verified & notarised${RESET} (stapled ticket) (Developer ID)"
+        fi
+      
+      else
+        
+        if check_if_app_from_app_store "${path_to_verify}"; then
+          echo "${path_basename}) ${GREEN}signed, properly verified & notarised${RESET} ${YELLOW}(no stapled ticket)${RESET} (App Store)"
+          # Apps from the AppStore never have stapled tickets
+        else
+          echo "${path_basename} ${GREEN}signed, properly verified & notarised${RESET} ${YELLOW}(no stapled ticket)${RESET} (Developer ID)"
+          # Developer ID apps can have stapled tickets, not a requiremnt though
+        fi
+      fi
+    
+    else
+      echo "${path_basename} ${GREEN}signed and properly verified${RESET} but ${RED}not notarised${RESET}"
+    fi
+
+  else
+    codesign_error_output=$(echo "${codesign_output}" | head -n 1 | awk -F ':' '{print $2}')
+    # head -n 1 removes the "In architecture" output which indicates in a Fat/Universal binary which
+    #   specific binary has failed code signing checks. 
+    # Output is either x86_64 or arm64e
+    # Currently don't care about which binary has fialed code signing checks just that one or the other has
+    echo "${path_basename} ${RED}${codesign_error_output}${RESET}"
+    return 1
+  fi
+}
+
+
+function verify_package_signature {
+  # verify_package_signature
+  #   Verify that package (.pkg) at $path_to_verify is correctly code signed
+  #   Save codesign output in $pkgutil_error_output for printing errors
+
+  if pkgutil_output="$(/usr/sbin/pkgutil --check-signature "${path_to_verify}")"; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+
+function check_package_notarised {
+  # check_package_notarised
+  #   Check if package is allowed to be run and install under current system policy
+  #   On systems with default settings this will check if app is notarised
+  #   If SecAssessment has been disabled spctl notarisation checks will fail
+  #   If system has SecAssessment disabled (e.g. spctl --master-disable has been executed)
+  #     you can execute codesign --test-requirement="=notarized" --verify to check notarisation
+
+  declare -r path_to_verify=${1:?path_to_verify not passed to check_package_notarised}
+
+  if /usr/sbin/spctl --assess --type install "${path_to_verify}"; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+
+function verify_pkg {
+  # verify_pkg
+  #   Verify that package at $path_to_verify is correctly code signed
+  #   Save pkgutil output in $pkgutil_output for priting errors
+  #   Verify that package is notarised via spctl
+
+  declare -r path_to_verify=${1:?path_to_verify not passed to verify_pkg}
+  path_basename=$(/usr/bin/basename "${path_to_verify}")
+
+  if verify_package_signature "${path_to_verify}"; then
+
+    if check_package_notarised "${path_to_verify}"; then
+
+      if check_stapled_notarisation_ticket "${path_to_verify}"; then
+        echo "${path_basename} ${GREEN}signed, properly verified & notarised${RESET} (stapled ticket)"
+      else
+        echo "${path_basename} ${GREEN}signed, properly verified & notarised${RESET} ${YELLOW}(no stapled ticket)${RESET}"
+      fi
+
+    else
+      echo "${path_basename} ${GREEN}signed, properly verified but ${RED}not notarised{$RESET}"
+    fi
+
+  else
+    pkgutil_error_output=$(echo "${pkgutil_output}" | tail -n +2 | awk -F ':' '{print $2}')
+    # tail -n +2 removes the first line of output "Package "install2.pkg":"
+    # I've only tested this on "no signature" output so might be fucked for other error output
+    # Use pkgutil to expand then flatten a package to reproduce
+    echo "${path_basename} ${RED}${pkgutil_error_output}${RESET}"
+    return 1
+  fi
+}
+
+
+function main {
+
+  trap ctrl_c SIGINT
+  # Detect and react to the user hitting CTRL + C
+
+  declare -r arg=${1:-"usage"}
+  declare -r path_to_verify=${2:-"null"}
+  # Set $path_to_verify to "null" if argv[2] is null or unset
+  # This is a probably a dirty hack that needs a proper solution
+  # Should be able to use parameter expansion but bug when using ${2+} which 
+  #   causes $path_to_verify to be set to empty even when argv[2] 
+  #   is not empty. i.e. with ${2+} ./c0design verify aaa 
+  #   for some reason it thinks argv[2] empty
+  declare -a apps
+  declare codesign_output
+  declare codesign_error_output
+  declare pkgutil_output
+  declare pkgutil_error_output
+
+  case "${arg}" in
+
+    usage|help|-h|--help|🤷‍♂️|🤷‍♀️|"¯\_(ツ)_/¯")
+      usage
+      ;;
+
+    list|-l|--list)
+      get_applications
+
+      for app in "${apps[@]}"; do
+        echo "${app}"
+      done
+      ;;
+
+    verify|-v|--verify)
+      if [[ "${path_to_verify}" == "null" ]]; then
+        usage
+      fi
+
+      if [[ "${path_to_verify}" =~ .pkg ]]; then
+        verify_pkg "${path_to_verify}"
+      else
+        verify_app "${path_to_verify}"
+      fi
+      ;;
+
+    thirdparty|-tp|--third-party)      
+      get_applications
+
+      for app in "${apps[@]}"; do
+        verify_app "${app}"
+      done
+      # Execution time roughly ~60 seconds
+      # Dependent on number and size of apps
+      ;;
+
+    *)
+      usage
+      ;;
+  esac
+
+}
+
+main "$@"
